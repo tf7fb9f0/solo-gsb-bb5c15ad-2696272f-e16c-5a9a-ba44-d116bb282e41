@@ -2,8 +2,16 @@
 
 基于 **Python + FastAPI + 标准库 `ipaddress`** 的 CIDR 策略规范化 API。
 
-接收 `allow` 与 `deny` 两个 CIDR 列表，分别对 **IPv4 / IPv6** 计算集合差
-**allow − deny**，返回与原策略**等价、互不重叠且数量最少**的 CIDR 集合。
+- `POST /normalize`：接收 `allow` 与 `deny` 两个 CIDR 列表，分别对
+  **IPv4 / IPv6** 计算集合差 **allow − deny**，返回与原策略**等价、互不重叠且
+  数量最少**的 CIDR 集合；
+- `POST /evaluate`：对裸地址做**最长前缀匹配**（同长度 deny 优先）；
+- `POST /compare`：在单个 scope 内对比 baseline / candidate 两组策略的判定差异；
+- `POST /allocate`：在单个 scope 内、绕开已占用网段，为一组带 `id` /
+  `prefix_length` 的申请寻找**互不重叠**的子网，按字典序最小给出完整方案
+  （必要时回溯），并返回分配后的最小剩余 CIDR 集合。
+
+`/normalize` 的输出特性：
 
 - deny 前缀切穿 allow 网段时，按二叉前缀树**递归对半拆分**直到边界对齐；
 - 仅当两个网段构成**完整相邻的兄弟前缀**（同一父网的左右两半）时才合并，
@@ -229,6 +237,91 @@ curl -s -X POST http://localhost:8000/compare \
 - `scope` 缺失、非法、主机位非零，或嵌套的 baseline/candidate 中存在
   非法 CIDR，统一返回 **HTTP 422**。
 
+### `POST /allocate`
+
+在**单个 `scope` CIDR** 内，绕开一组**已占用 CIDR**，为按序提交的子网申请
+（每项含 `id` 与 `prefix_length`）分配**互不重叠、边界对齐**的子网。所有申请
+必须能同时满足：存在任一申请无法放下时返回 **HTTP 409**，且**不返回任何
+部分分配**。
+
+请求体：
+
+| 字段       | 类型       | 说明                                   |
+| ---------- | ---------- | -------------------------------------- |
+| `scope`    | `string`   | **必填**，单个 CIDR（IPv4 或 IPv6）；主机位非零返回 422 |
+| `occupied` | `string[]` | 已占用 CIDR，可省略（默认 `[]`）；必须与 scope **同族、位于 scope 内、互不重叠**（重复也按重叠处理） |
+| `requests` | `object[]` | 子网申请，按此顺序处理与返回；每项形如 `{"id": "...", "prefix_length": 26}` |
+
+选网规则：
+
+1. 以申请顺序固定网络地址序列 `(cidr_0, cidr_1, …)`；
+2. 每项在可用空间中**从最低网络地址开始**尝试长度为 `prefix_length` 的对齐子网；
+3. 当前选择导致后面的申请无解时**回溯**，尝试下一个候选；
+4. 返回找到的第一个完整方案，即所有可行完整方案中按网络地址序列比较的
+   **字典序最小**者。
+
+示例（贪心会失败、必须回溯的场景：`10.0.0.192/26` 已占用，空闲为
+`10.0.0.0/25` 与 `10.0.0.128/26`；先申请 `/26`、再申请 `/25`，
+`10.0.0.0/26` 会让 `/25` 无处可放）：
+
+```bash
+curl -s -X POST http://localhost:8000/allocate \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "scope": "10.0.0.0/24",
+        "occupied": ["10.0.0.192/26"],
+        "requests": [
+          {"id": "small", "prefix_length": 26},
+          {"id": "big",   "prefix_length": 25}
+        ]
+      }'
+```
+
+响应（`allocations` 与 `requests` **同序**、等长）：
+
+```json
+{
+  "allocations": [
+    {"id": "small", "cidr": "10.0.0.128/26"},
+    {"id": "big",   "cidr": "10.0.0.0/25"}
+  ],
+  "remaining": [],
+  "remaining_addresses": "0"
+}
+```
+
+再如 scope 减去占用与分配后仍有剩余时，`remaining` 给出**等价、互不重叠且
+数量最少**的 CIDR 集合（与 `/normalize` 相同的兄弟合并规则）：
+
+```bash
+curl -s -X POST http://localhost:8000/allocate \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "scope": "10.0.0.0/24",
+        "occupied": ["10.0.0.128/26"],
+        "requests": [{"id": "net-a", "prefix_length": 25}]
+      }'
+# {"allocations":[{"id":"net-a","cidr":"10.0.0.0/25"}],
+#  "remaining":["10.0.0.192/26"],"remaining_addresses":"64"}
+```
+
+字段说明：
+
+- `allocations[].id`：原样回显的申请标识；
+- `allocations[].cidr`：分配到的规范严格 CIDR，顺序与 `requests` 一致；
+- `remaining`：scope 减去全部 occupied 与 allocations 后的**最小 CIDR 集合**，
+  按网络地址排序；
+- `remaining_addresses`：`remaining` 覆盖的**地址总数（十进制字符串）**，
+  IPv6 量级也不会丢失精度。
+
+错误处理：
+
+- 任一申请无法与其它申请一起满足（包括申请前缀比 scope 更粗，如 scope `/25`
+  申请 `/24`）→ **HTTP 409**，响应只含错误详情，不含部分分配；
+- 重复 `id`、`prefix_length` 超出地址族上限（IPv4 为 32、IPv6 为 128）或为
+  负数、非法 `scope` / `occupied` CIDR、occupied 与 scope 不同族或超出 scope、
+  occupied 之间互相重叠 → **HTTP 422**。
+
 ## 算法说明
 
 1. **解析校验**：`ipaddress.ip_network(value, strict=True)` 严格解析；
@@ -254,6 +347,21 @@ curl -s -X POST http://localhost:8000/compare \
 3. 按转换标签做**带标签的完整兄弟合并**（不动点循环）：同一父网的左右
    两半都在、且转换类型完全相同时才合并，合并后的父网段继续向上合并。
 
+`/allocate`（`app/policy.py` 中 `allocate` / `_allocate_search`）：
+
+1. 先用 `/normalize` 的差集逻辑把 scope 减去 occupied，得到初始的**最小
+   空闲瓦片集合**；
+2. 深度优先搜索：申请顺序固定，每个申请按**网络地址升序**枚举空闲瓦片中
+   所有 `prefix_length` 对齐子网，取走候选时用 `address_exclude` 把它所在的
+   瓦片原地替换为剩余部分（始终保持最小、互不重叠），递归处理下一申请；
+3. 每个递归节点做**分层槽位容量检查**：把地址空间看成 `/p` 对齐槽，粗于
+   `/p` 的申请占用整槽、细于 `/p` 的申请可共享槽；只有比 `/p` 更粗的瓦片才
+   贡献完整 `/p` 槽。容量不足立即剪枝；
+4. 无解时逐层撤销试探性拆分并回溯；第一个找到的完整方案即为字典序最小者，
+   任一申请无解则抛出 409 且不暴露部分结果；
+5. 成功后剩余瓦片集合即为 scope − occupied − allocations 的最小 CIDR 集合，
+   地址总数以十进制字符串返回。
+
 ## 本地开发（不使用 Docker）
 
 需要 Python 3.11+：
@@ -278,12 +386,12 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、分区对比（仅 ipaddress）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/allocate
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、分区对比、字典序最小分配（仅 ipaddress）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare 逐地址对拍）
-│   └── test_api.py    # API 层测试（422、统计、空请求等）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare 逐地址对拍、/allocate 暴力枚举对拍）
+│   └── test_api.py    # API 层测试（422、409、统计、空请求等）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

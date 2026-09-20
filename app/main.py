@@ -1,12 +1,14 @@
-"""FastAPI application exposing POST /normalize, /evaluate and /compare."""
+"""FastAPI application exposing POST /normalize, /evaluate, /compare and /allocate."""
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
-from app.policy import compare, evaluate, normalize
+from app.policy import AllocationImpossible, allocate, compare, evaluate, normalize
 from app.schemas import (
     AddressDecision,
+    AllocateRequest,
+    AllocateResponse,
     CompareRequest,
     CompareResponse,
     EvaluateRequest,
@@ -20,10 +22,11 @@ app = FastAPI(
         "Compute allow-minus-deny for IPv4/IPv6 CIDR lists, returning the "
         "equivalent, non-overlapping, minimum-count CIDR set; evaluate "
         "individual addresses against the same lists via longest-prefix "
-        "match; and diff two policy sets (baseline vs candidate) over a "
-        "scope CIDR."
+        "match; diff two policy sets (baseline vs candidate) over a "
+        "scope CIDR; and allocate mutually-non-overlapping subnets inside "
+        "a scope while avoiding occupied CIDRs."
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -203,3 +206,92 @@ def compare_policies(request: CompareRequest) -> dict:
         request.candidate.allow,
         request.candidate.deny,
     )
+
+
+@app.post(
+    "/allocate",
+    response_model=AllocateResponse,
+    tags=["policy"],
+    summary="Allocate mutually-non-overlapping subnets inside a scope",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "lexicographically_smallest_plan": {
+                            "summary": "Backtracking picks the smallest complete plan",
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "occupied": ["10.0.0.128/26"],
+                                "requests": [
+                                    {"id": "net-a", "prefix_length": 25},
+                                    {"id": "net-b", "prefix_length": 26},
+                                ],
+                            },
+                        },
+                        "impossible_conflict": {
+                            "summary": "One /25 cannot fit two /24 requests -> 409",
+                            "value": {
+                                "scope": "10.0.0.0/25",
+                                "occupied": [],
+                                "requests": [
+                                    {"id": "big-1", "prefix_length": 24},
+                                    {"id": "big-2", "prefix_length": 24},
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "One allocation per request (in request order), plus the "
+                "minimum CIDR set left in scope."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "lexicographically_smallest_plan": {
+                            "summary": "net-a takes the lower /25",
+                            "value": {
+                                "allocations": [
+                                    {"id": "net-a", "cidr": "10.0.0.0/25"},
+                                    {"id": "net-b", "cidr": "10.0.0.192/26"},
+                                ],
+                                "remaining": [],
+                                "remaining_addresses": "0",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        409: {
+            "description": (
+                "No complete non-overlapping plan exists; no partial "
+                "allocation is returned."
+            ),
+        },
+        422: {
+            "description": (
+                "Malformed input: bad scope/CIDR syntax, family mismatch, an "
+                "occupied network outside scope or overlapping another, a "
+                "duplicate id, or an out-of-range prefix length."
+            ),
+        },
+    },
+)
+def allocate_subnets(request: AllocateRequest) -> dict:
+    try:
+        return allocate(
+            request.scope,
+            request.occupied,
+            [(item.id, item.prefix_length) for item in request.requests],
+        )
+    except AllocationImpossible as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

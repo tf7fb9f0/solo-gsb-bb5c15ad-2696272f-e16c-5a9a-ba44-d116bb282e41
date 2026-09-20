@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.policy import parse_address, parse_network
 
@@ -138,4 +138,114 @@ class CompareResponse(BaseModel):
             "as decimal strings; all six transitions are present (0 when "
             "unused)."
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# /allocate
+# ---------------------------------------------------------------------------
+
+
+class AllocationRequestItem(BaseModel):
+    id: str = Field(
+        description="Client-chosen identifier echoed back; must be unique.",
+    )
+    prefix_length: int = Field(
+        ge=0,
+        description=(
+            "Requested subnet prefix length within the scope family "
+            "(0-32 for IPv4, 0-128 for IPv6)."
+        ),
+    )
+
+
+class AllocateRequest(BaseModel):
+    scope: str = Field(
+        description=(
+            "Single CIDR (IPv4 or IPv6) that every occupied network and "
+            "allocation must lie inside. Strict: host bits must be zero."
+        ),
+    )
+    occupied: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Already-used CIDRs: same family as scope, contained in scope, "
+            "pairwise non-overlapping; duplicates are rejected."
+        ),
+    )
+    requests: list[AllocationRequestItem] = Field(
+        default_factory=list,
+        description="Subnet requests in the order the response must follow.",
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        parse_network(value)
+        return value
+
+    @field_validator("occupied")
+    @classmethod
+    def _validate_occupied_strings(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_network(value)
+        return values
+
+    @model_validator(mode="after")
+    def _validate_allocation_inputs(self) -> AllocateRequest:
+        # Scope alone being malformed aborts the cross-field checks; the
+        # scope field validator already produced the 422 error for it.
+        scope = parse_network(self.scope)
+
+        occupied_nets = [parse_network(value) for value in self.occupied]
+        for network in occupied_nets:
+            if network.version != scope.version:
+                raise ValueError(
+                    f"occupied {network} is not the same address family as "
+                    f"scope {scope}"
+                )
+            if not network.subnet_of(scope):
+                raise ValueError(
+                    f"occupied {network} is not contained in scope {scope}"
+                )
+        for i, left in enumerate(occupied_nets):
+            for right in occupied_nets[i + 1:]:
+                if left.overlaps(right):
+                    raise ValueError(
+                        f"occupied networks overlap: {left} and {right}"
+                    )
+
+        seen_ids: set[str] = set()
+        max_prefixlen = scope.max_prefixlen
+        for item in self.requests:
+            if item.prefix_length > max_prefixlen:
+                raise ValueError(
+                    f"prefix_length {item.prefix_length} exceeds the "
+                    f"{scope.version} family maximum of {max_prefixlen}"
+                )
+            if item.id in seen_ids:
+                raise ValueError(f"duplicate request id: {item.id!r}")
+            seen_ids.add(item.id)
+        return self
+
+
+class AllocationItem(BaseModel):
+    id: str = Field(description="Echoed request identifier.")
+    cidr: str = Field(
+        description="Allocated aligned subnet, canonical strict CIDR.",
+    )
+
+
+class AllocateResponse(BaseModel):
+    allocations: list[AllocationItem] = Field(
+        description="One allocation per request, in request order.",
+    )
+    remaining: list[str] = Field(
+        description=(
+            "Minimum, non-overlapping CIDR set left in scope after subtracting "
+            "occupied and allocated networks; sorted by network address."
+        ),
+    )
+    remaining_addresses: str = Field(
+        description="Total addresses covered by remaining, as a decimal string.",
     )

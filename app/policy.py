@@ -427,6 +427,151 @@ def _merge_labelled(
         ]
 
 
+# ---------------------------------------------------------------------------
+# allocate: lexicographically-smallest complete non-overlapping subnet plan
+# ---------------------------------------------------------------------------
+
+
+class AllocationImpossible(Exception):
+    """No complete mutually-non-overlapping allocation exists within scope."""
+
+
+def _candidate_subnets(
+    pieces: Sequence[Network],
+    prefix_length: int,
+) -> Iterable[Network]:
+    """Yield every ``prefix_length``-aligned subnet inside the free pieces.
+
+    The pieces are disjoint and address-sorted; each ``subnets()`` run is
+    itself emitted in ascending order, so concatenating the runs stays
+    globally ascending — which is exactly the order the backtracking search
+    tries candidates in.
+    """
+    for piece in pieces:
+        if piece.prefixlen <= prefix_length:
+            yield from piece.subnets(new_prefix=prefix_length)
+
+
+def _capacity_feasible(
+    pieces: Sequence[Network],
+    prefixes: Sequence[int],
+) -> bool:
+    """Hierarchical slot-capacity necessary condition, checked at each depth.
+
+    At depth ``p`` the address space is viewed as aligned ``/p`` bins.  A
+    request for prefix ``r <= p`` occupies ``2**(p-r)`` whole bins; requests
+    finer than ``p`` take less than a bin and may share one, so they impose
+    no demand at this depth.  A free piece of prefix ``q <= p`` contains
+    exactly ``2**(p-q)`` complete aligned bins, while a piece finer than
+    ``/p`` contains none — a fragment must never be credited a whole bin it
+    does not provide.  A shortfall at any requested depth proves the branch
+    infeasible, pruning the (worst-case exponential) backtracking cheaply.
+    """
+    for depth in set(prefixes):
+        required = sum(1 << (depth - r) for r in prefixes if r <= depth)
+        available = sum(
+            1 << (depth - piece.prefixlen)
+            for piece in pieces
+            if piece.prefixlen <= depth
+        )
+        if required > available:
+            return False
+    return True
+
+
+def _allocate_search(
+    free: list[Network],
+    prefixes: Sequence[int],
+    index: int,
+    chosen: list[Network],
+) -> list[Network] | None:
+    """Depth-first search for the lexicographically-smallest complete plan.
+
+    Requests are fixed in request order; at each index candidates are tried
+    from the lowest network address upwards, so the first complete solution
+    found is the smallest tuple ``(net_0, net_1, ...)``.  On success
+    ``free`` is left holding the post-allocation remainder pieces; on
+    failure every tentative split is restored and ``None`` is returned.
+    """
+    if index == len(prefixes):
+        return []
+    if not _capacity_feasible(free, prefixes[index:]):
+        return None
+
+    prefix_length = prefixes[index]
+    for candidate in _candidate_subnets(free, prefix_length):
+        if any(candidate.overlaps(net) for net in chosen):
+            continue
+
+        # The candidate sits inside exactly one free piece; tentatively
+        # replace that piece by scope-piece minus candidate.  address_exclude
+        # returns the maximal aligned remainder, keeping the piece set
+        # minimal and non-overlapping.
+        host_index = next(
+            i for i, piece in enumerate(free) if candidate.subnet_of(piece)
+        )
+        host = free[host_index]
+        leftovers = (
+            sorted(host.address_exclude(candidate), key=_sort_key)
+            if candidate != host
+            else []
+        )
+        free[host_index:host_index + 1] = leftovers
+        chosen.append(candidate)
+
+        rest = _allocate_search(free, prefixes, index + 1, chosen)
+        if rest is None:
+            # Dead end below: undo the tentative split before trying the
+            # next candidate.  On the success path the split is kept on
+            # purpose, so ``free`` becomes the post-allocation remainder.
+            chosen.pop()
+            free[host_index:host_index + len(leftovers)] = [host]
+        else:
+            return [candidate, *rest]
+    return None
+
+
+def allocate(
+    scope_raw: str,
+    occupied_raw: Sequence[str],
+    items: Sequence[tuple[str, int]],
+) -> dict:
+    """Allocate one aligned subnet per request inside scope, avoiding occupied.
+
+    The occupied networks are assumed validated already (same family as
+    scope, contained in scope, pairwise non-overlapping — e.g. by the
+    Pydantic schema).  The lexicographically-smallest complete plan is
+    returned with backtracking; when no complete plan exists
+    :class:`AllocationImpossible` is raised and no partial plan is exposed.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+    occupied = [parse_network(item) for item in occupied_raw]
+    ids = [item_id for item_id, _ in items]
+    prefixes = [prefix_length for _, prefix_length in items]
+
+    # Free space starts as the minimal tiling of scope minus occupied; the
+    # search mutates this very list, so on success it already holds the
+    # post-allocation remainder.
+    free = _normalize_family([scope], occupied, family)
+    plan = _allocate_search(free, prefixes, 0, [])
+    if plan is None:
+        raise AllocationImpossible(
+            "no complete non-overlapping allocation satisfies every request "
+            f"within scope {scope}"
+        )
+
+    remaining_addresses = sum(network.num_addresses for network in free)
+    return {
+        "allocations": [
+            {"id": item_id, "cidr": str(network)}
+            for item_id, network in zip(ids, plan, strict=True)
+        ],
+        "remaining": [str(network) for network in free],
+        "remaining_addresses": str(remaining_addresses),
+    }
+
+
 def compare(
     scope_raw: str,
     baseline_allow: Sequence[str],
