@@ -6,6 +6,11 @@ network is recursively split into its two halves until every deny boundary is
 aligned with a prefix.  Pieces are merged back only when they form two
 complete, adjacent sibling prefixes (via :func:`ipaddress.collapse_addresses`),
 which yields the equivalent, non-overlapping and minimum-cardinality CIDR set.
+
+The module also hosts two scope-based consumers of the same primitives:
+``compare`` (decision diff of two policy sets inside one scope) and
+``allocate`` (lexicographically smallest non-overlapping subnet assignment
+inside one scope, avoiding occupied CIDRs).
 """
 
 from __future__ import annotations
@@ -476,4 +481,199 @@ def compare(
         "transition_counts": {
             key: str(counts[key]) for key in TRANSITION_KEYS
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# allocate: subnet assignment inside one scope.  Requests are fulfilled in
+# request order; among all complete feasible assignments the one whose
+# sequence of network addresses (in request order) is lexicographically
+# smallest is returned, using depth-first search with backtracking.
+# ---------------------------------------------------------------------------
+
+
+def _subtract_free(free: Sequence[Network], block: Network) -> list[Network]:
+    """Remove ``block`` from the sorted, non-overlapping free list.
+
+    ``block`` is an aligned subnet of exactly one free piece; that piece is
+    replaced by its :meth:`ipaddress.IPv4Network.address_exclude`
+    decomposition, which keeps the list sorted, non-overlapping and minimal
+    (pieces of one exclusion are never mergeable siblings, and pieces of
+    different original blocks stay separated by non-free gaps).
+    """
+    out: list[Network] = []
+    for net in free:
+        if block.subnet_of(net):
+            out.extend(net.address_exclude(block))
+        else:
+            out.append(net)
+    out.sort(key=_sort_key)
+    return out
+
+
+def _aligned_candidates(
+    free: Sequence[Network],
+    prefixlen: int,
+    max_bits: int,
+) -> Iterable[Network]:
+    """Yield every aligned ``/prefixlen`` subnet of the free space, in order.
+
+    Iteration is lazy and follows the sorted free list, so candidates come
+    out in strictly increasing network-address order — exactly the order the
+    lexicographic search must try them in.
+    """
+    size = 1 << (max_bits - prefixlen)
+    for net in free:
+        if net.prefixlen > prefixlen:
+            # This free piece is itself smaller than the requested block.
+            continue
+        base = int(net.network_address)
+        for offset in range(0, net.num_addresses, size):
+            yield type(net)((base + offset, prefixlen))
+
+
+def _fits(free: Sequence[Network], prefixlens: Sequence[int]) -> bool:
+    """Necessary capacity condition for placing ``prefixlens`` in ``free``.
+
+    At every requested granularity ``p``, the still-unplaced requests with
+    prefix length ``<= p`` need ``sum(2 ** (p - q))`` aligned ``/p`` slots,
+    while the free space offers one such slot per ``/p`` block inside each
+    free piece at least as large.  Checking only the requested prefix
+    lengths suffices: between two consecutive requested lengths both sides
+    of the inequality at least double, so no new violation can appear.
+    """
+    for prefix in set(prefixlens):
+        required = sum(1 << (prefix - q) for q in prefixlens if q <= prefix)
+        available = sum(
+            1 << (prefix - net.prefixlen)
+            for net in free
+            if net.prefixlen <= prefix
+        )
+        if required > available:
+            return False
+    return True
+
+
+def _search(
+    free: Sequence[Network],
+    prefixlens: Sequence[int],
+    max_bits: int,
+    memo: set,
+) -> list[Network] | None:
+    """DFS over candidates in address order; first complete plan is lex-min.
+
+    ``prefixlens[d]`` is placed at depth ``d``; every aligned candidate
+    subnet is tried in increasing network-address order, so the first
+    complete assignment found is the lexicographically smallest feasible
+    sequence.  ``memo`` caches failed ``(depth, free-state)`` keys —
+    feasibility of a state depends only on the remaining free space and
+    the remaining requests, never on how the state was reached.  The
+    traversal is iterative so the request count is not bounded by the
+    interpreter's recursion limit.
+    """
+    if not prefixlens:
+        return []
+
+    def state_key(depth: int, free_nets: Sequence[Network]) -> tuple:
+        return (
+            depth,
+            tuple(
+                (int(net.network_address), net.prefixlen) for net in free_nets
+            ),
+        )
+
+    def enter(depth: int) -> Iterable[Network] | None:
+        """Prune the state at ``depth`` or return its candidate iterator."""
+        key = state_key(depth, frees[depth])
+        if key in memo:
+            return None
+        if not _fits(frees[depth], prefixlens[depth:]):
+            memo.add(key)
+            return None
+        return _aligned_candidates(frees[depth], prefixlens[depth], max_bits)
+
+    # Invariant while ``candidates`` is non-empty: depth d = len(candidates)-1
+    # is the deepest entered state, frees[d] its free list, and ``chosen``
+    # holds the d blocks (depths 0..d-1) that led to it.
+    frees: list[Sequence[Network]] = [list(free)]
+    first = enter(0)
+    if first is None:
+        return None
+    candidates: list[Iterable[Network]] = [first]
+    chosen: list[Network] = []
+
+    while candidates:
+        depth = len(candidates) - 1
+        block = next(candidates[-1], None)
+        if block is None:
+            # Every candidate at this depth failed: memoize and backtrack.
+            memo.add(state_key(depth, frees[depth]))
+            candidates.pop()
+            frees.pop()
+            if chosen:
+                chosen.pop()
+            continue
+        if depth == len(prefixlens) - 1:
+            # Last request placed: the complete, lexicographically smallest
+            # plan, in request order.
+            return [*chosen, block]
+        # Descend: tentatively place the block, then prune or enter the
+        # child state; undo the descend if the child is already infeasible.
+        chosen.append(block)
+        frees.append(_subtract_free(frees[depth], block))
+        child = enter(depth + 1)
+        if child is None:
+            chosen.pop()
+            frees.pop()
+            continue
+        candidates.append(child)
+    return None
+
+
+def allocate(
+    scope_raw: str,
+    occupied_raw: Sequence[str],
+    requests: Sequence[tuple[str, int]],
+) -> dict | None:
+    """Assign one subnet per ``(id, prefix_length)`` request inside ``scope``.
+
+    Allocations are non-overlapping, avoid every occupied CIDR and follow
+    request order; among all complete feasible assignments the one with the
+    lexicographically smallest sequence of network addresses wins.  Returns
+    ``None`` when no complete assignment exists (the caller maps this to
+    HTTP 409 and must not emit partial allocations).
+
+    Inputs are assumed validated already (e.g. by the Pydantic schema):
+    occupied CIDRs share the scope family, lie inside it and do not overlap;
+    request ids are unique; prefix lengths fit the address family.  A
+    malformed value raises :class:`ValueError`.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+    max_bits = _MAX_PREFIXLEN[family]
+
+    occupied = [parse_network(item) for item in occupied_raw]
+    # Free space before any allocation: scope minus the occupied CIDRs, as a
+    # minimal, sorted, non-overlapping CIDR list.
+    free = _normalize_family([scope], occupied, family)
+
+    prefixlens = [prefix_length for _, prefix_length in requests]
+    chosen = _search(free, prefixlens, max_bits, memo=set())
+    if chosen is None:
+        return None
+
+    remaining = free
+    for block in chosen:
+        remaining = _subtract_free(remaining, block)
+
+    return {
+        "allocations": [
+            {"id": request_id, "cidr": str(network)}
+            for (request_id, _), network in zip(requests, chosen, strict=True)
+        ],
+        "remaining": [str(net) for net in remaining],
+        # Decimal string: IPv6 remainders exceed JSON's safe integer range.
+        "remaining_addresses": str(
+            sum(net.num_addresses for net in remaining)
+        ),
     }

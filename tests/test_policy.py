@@ -9,6 +9,7 @@ import pytest
 
 from app.policy import (
     _normalize_family,
+    allocate,
     compare,
     evaluate,
     normalize,
@@ -609,3 +610,219 @@ def test_compare_matches_pointwise_evaluation_ipv6(seed):
     _assert_compare_exhaustive(
         scope, random_list(), random_list(), random_list(), random_list()
     )
+
+
+# --------------------------------------------------------------------------
+# allocate: lexicographically smallest non-overlapping subnet assignment
+# --------------------------------------------------------------------------
+
+
+def test_allocate_basic_lexicographic_order():
+    result = allocate(
+        "10.0.0.0/24", ["10.0.0.0/25"], [("b", 26), ("a", 26)]
+    )
+    assert result == {
+        "allocations": [
+            {"id": "b", "cidr": "10.0.0.128/26"},
+            {"id": "a", "cidr": "10.0.0.192/26"},
+        ],
+        "remaining": [],
+        "remaining_addresses": "0",
+    }
+
+
+def test_allocate_sequence_order_follows_requests_not_addresses():
+    # The lexicographic key is the address sequence in request order: the
+    # /26 goes to the lowest free block, the /25 takes what remains.
+    result = allocate("10.0.0.0/24", [], [("x", 26), ("y", 25)])
+    assert result["allocations"] == [
+        {"id": "x", "cidr": "10.0.0.0/26"},
+        {"id": "y", "cidr": "10.0.0.128/25"},
+    ]
+    assert result["remaining"] == ["10.0.0.64/26"]
+
+
+def test_allocate_backtracks_to_lexicographic_minimum():
+    # First-fit for "small" (10.0.0.0/25 or 10.0.0.128/25) strands the /24;
+    # the only complete plans put "small" at 10.0.1.128/25.
+    result = allocate(
+        "10.0.0.0/23", ["10.0.1.0/25"], [("small", 25), ("big", 24)]
+    )
+    assert [item["cidr"] for item in result["allocations"]] == [
+        "10.0.1.128/25", "10.0.0.0/24",
+    ]
+    assert result["remaining"] == []
+
+
+def test_allocate_infeasible_returns_none():
+    # Two /25s beside an occupied /25.
+    assert allocate(
+        "10.0.0.0/24", ["10.0.0.0/25"], [("x", 25), ("y", 25)]
+    ) is None
+    # A prefix shorter than the scope prefix can never fit inside it.
+    assert allocate("10.0.0.0/24", [], [("wan", 16)]) is None
+    # Scope fully occupied.
+    assert allocate("10.0.0.0/24", ["10.0.0.0/24"], [("x", 32)]) is None
+    # Fragmentation: two /26 holes cannot host a /25.
+    assert allocate(
+        "10.0.0.0/24",
+        ["10.0.0.0/26", "10.0.0.128/26"],
+        [("x", 25)],
+    ) is None
+
+
+def test_allocate_empty_requests_returns_free_space():
+    result = allocate("10.0.0.0/24", ["10.0.0.0/25"], [])
+    assert result == {
+        "allocations": [],
+        "remaining": ["10.0.0.128/25"],
+        "remaining_addresses": "128",
+    }
+
+
+def test_allocate_host_prefix_scope_and_request():
+    result = allocate("10.0.0.5/32", [], [("host", 32)])
+    assert result["allocations"] == [{"id": "host", "cidr": "10.0.0.5/32"}]
+    assert result["remaining"] == []
+    assert result["remaining_addresses"] == "0"
+
+
+def test_allocate_ipv6():
+    result = allocate(
+        "2001:db8::/126", ["2001:db8::1/128"], [("node", 128)]
+    )
+    assert result["allocations"] == [{"id": "node", "cidr": "2001:db8::/128"}]
+    assert result["remaining"] == ["2001:db8::2/127"]
+    assert result["remaining_addresses"] == "2"
+
+
+def test_allocate_remaining_is_minimal_and_non_overlapping():
+    result = allocate(
+        "10.0.0.0/24",
+        ["10.0.0.64/26", "10.0.0.128/26"],
+        [("first", 26)],
+    )
+    assert result["allocations"] == [{"id": "first", "cidr": "10.0.0.0/26"}]
+    assert result["remaining"] == ["10.0.0.192/26"]
+    assert result["remaining_addresses"] == "64"
+
+
+def _brute_force_allocate(scope_raw, occupied_raw, requests):
+    """Reference: enumerate every feasible assignment and keep the one whose
+    network-address sequence (in request order) is lexicographically minimal.
+    """
+    scope = ipaddress.ip_network(scope_raw)
+    occupied = [ipaddress.ip_network(item) for item in occupied_raw]
+    max_bits = 32 if scope.version == 4 else 128
+    free = _normalize_family([scope], occupied, type(scope))
+
+    def candidates(free_nets, prefixlen):
+        size = 1 << (max_bits - prefixlen)
+        for net in free_nets:
+            if net.prefixlen <= prefixlen:
+                base = int(net.network_address)
+                for offset in range(0, net.num_addresses, size):
+                    yield type(net)((base + offset, prefixlen))
+
+    def subtract(free_nets, block):
+        out = []
+        for net in free_nets:
+            if block.subnet_of(net):
+                out.extend(net.address_exclude(block))
+            else:
+                out.append(net)
+        return out
+
+    best = None
+
+    def rec(free_nets, depth, acc):
+        nonlocal best
+        if depth == len(requests):
+            key = tuple(int(net.network_address) for net in acc)
+            if best is None or key < best[0]:
+                best = (key, list(acc))
+            return
+        for candidate in candidates(free_nets, requests[depth][1]):
+            rec(subtract(free_nets, candidate), depth + 1, acc + [candidate])
+
+    rec(free, 0, [])
+    return None if best is None else best[1]
+
+
+def _assert_allocate_matches_brute_force(scope, occupied, requests):
+    occupied_raw = [str(net) for net in occupied]
+    expected = _brute_force_allocate(str(scope), occupied_raw, requests)
+    result = allocate(str(scope), occupied_raw, requests)
+
+    if expected is None:
+        assert result is None
+        return
+
+    assert result is not None
+    chosen = [
+        ipaddress.ip_network(item["cidr"]) for item in result["allocations"]
+    ]
+    # Exactly the lexicographically smallest feasible sequence, with the
+    # request ids attached in request order.
+    assert chosen == expected
+    assert [item["id"] for item in result["allocations"]] == [
+        request_id for request_id, _ in requests
+    ]
+    # Sanity: allocations lie in scope, avoid occupied, and are disjoint.
+    for (_, prefix_length), network in zip(requests, chosen, strict=True):
+        assert network.subnet_of(scope)
+        assert network.prefixlen == prefix_length
+        assert not any(network.overlaps(net) for net in occupied)
+    for i, left in enumerate(chosen):
+        for right in chosen[i + 1:]:
+            assert not left.overlaps(right)
+    # Remaining space equals scope - occupied - allocations, minimally.
+    leftover = _normalize_family([scope], [*occupied, *chosen], type(scope))
+    assert result["remaining"] == [str(net) for net in leftover]
+    assert int(result["remaining_addresses"]) == sum(
+        net.num_addresses for net in leftover
+    )
+
+
+def _random_occupied(rng, scope, max_bits):
+    """Random, mutually non-overlapping strict subnets of ``scope``."""
+    occupied = []
+    for _ in range(rng.randint(0, 3)):
+        prefixlen = rng.randint(scope.prefixlen, min(scope.prefixlen + 2, max_bits))
+        slot = rng.randrange(1 << (prefixlen - scope.prefixlen))
+        addr = int(scope.network_address) + slot * (1 << (max_bits - prefixlen))
+        net = type(scope)((addr, prefixlen))
+        if all(not net.overlaps(other) for other in occupied):
+            occupied.append(net)
+    return occupied
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_allocate_matches_brute_force_ipv4(seed):
+    rng = random.Random(4000 + seed)
+    prefixlen = rng.randint(28, 30)  # small scopes keep enumeration cheap
+    base = rng.randrange(2 ** 32) & ~((1 << (32 - prefixlen)) - 1)
+    scope = ipaddress.IPv4Network((base, prefixlen))
+    occupied = _random_occupied(rng, scope, 32)
+    requests = [
+        (f"r{i}", rng.randint(prefixlen, 32))
+        for i in range(rng.randint(0, 3))
+    ]
+    _assert_allocate_matches_brute_force(scope, occupied, requests)
+
+
+@pytest.mark.parametrize("seed", range(16))
+def test_allocate_matches_brute_force_ipv6(seed):
+    rng = random.Random(5000 + seed)
+    prefixlen = rng.randint(124, 126)
+    base = int(ipaddress.IPv6Address("2001:db8::"))
+    host = rng.randrange(2 ** (128 - prefixlen))
+    scope = ipaddress.IPv6Network(
+        (base + (host << (128 - prefixlen)), prefixlen)
+    )
+    occupied = _random_occupied(rng, scope, 128)
+    requests = [
+        (f"r{i}", rng.randint(prefixlen, 128))
+        for i in range(rng.randint(0, 3))
+    ]
+    _assert_allocate_matches_brute_force(scope, occupied, requests)

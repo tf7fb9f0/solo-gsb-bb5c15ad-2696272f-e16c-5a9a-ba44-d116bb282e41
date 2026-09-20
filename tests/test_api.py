@@ -381,3 +381,236 @@ def test_compare_is_documented_in_openapi():
         "examples"
     ]
     assert "deny_supernet_holes" in examples
+
+
+# --------------------------------------------------------------------------
+# POST /allocate
+# --------------------------------------------------------------------------
+
+
+def test_allocate_basic_preserves_request_order():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "occupied": ["10.0.0.0/25"],
+            "requests": [
+                {"id": "b", "prefix_length": 26},
+                {"id": "a", "prefix_length": 26},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    # Response follows request order (b before a), not id or address order.
+    assert data["allocations"] == [
+        {"id": "b", "cidr": "10.0.0.128/26"},
+        {"id": "a", "cidr": "10.0.0.192/26"},
+    ]
+    assert data["remaining"] == []
+    assert data["remaining_addresses"] == "0"
+
+
+def test_allocate_backtracks_to_lexicographically_smallest_plan():
+    # Free space: 10.0.0.0/24 and 10.0.1.128/25.  Giving "small" the
+    # lowest /25 (10.0.0.0/25 or 10.0.0.128/25) leaves no room for the
+    # /24, so the search must backtrack and place "small" at 10.0.1.128/25.
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/23",
+            "occupied": ["10.0.1.0/25"],
+            "requests": [
+                {"id": "small", "prefix_length": 25},
+                {"id": "big", "prefix_length": 24},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["allocations"] == [
+        {"id": "small", "cidr": "10.0.1.128/25"},
+        {"id": "big", "cidr": "10.0.0.0/24"},
+    ]
+    assert data["remaining"] == []
+    assert data["remaining_addresses"] == "0"
+
+
+def test_allocate_remaining_is_minimal_cidr_set():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "occupied": ["10.0.0.64/26", "10.0.0.128/26"],
+            "requests": [{"id": "first", "prefix_length": 26}],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["allocations"] == [{"id": "first", "cidr": "10.0.0.0/26"}]
+    # 10.0.0.192/26 survives whole; the freed /26 siblings are not merged
+    # across the occupied blocks.
+    assert data["remaining"] == ["10.0.0.192/26"]
+    assert data["remaining_addresses"] == "64"
+
+
+def test_allocate_empty_requests_returns_free_space():
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.0/24", "occupied": ["10.0.0.0/25"]},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "allocations": [],
+        "remaining": ["10.0.0.128/25"],
+        "remaining_addresses": "128",
+    }
+
+
+def test_allocate_ipv6_decimal_string_count():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "2001:db8::/126",
+            "occupied": ["2001:db8::1/128"],
+            "requests": [{"id": "node", "prefix_length": 128}],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["allocations"] == [{"id": "node", "cidr": "2001:db8::/128"}]
+    assert data["remaining"] == ["2001:db8::2/127"]
+    assert data["remaining_addresses"] == "2"
+
+
+def test_allocate_infeasible_returns_409_without_partial_allocation():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "occupied": ["10.0.0.0/25"],
+            "requests": [
+                {"id": "x", "prefix_length": 25},
+                {"id": "y", "prefix_length": 25},
+            ],
+        },
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert "allocations" not in body
+    assert "remaining" not in body
+
+
+def test_allocate_prefix_shorter_than_scope_returns_409():
+    # A /16 can never be a subnet of a /24 scope: unsatisfiable, not invalid.
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "requests": [{"id": "wan", "prefix_length": 16}],
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_allocate_duplicate_id_returns_422():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "requests": [
+                {"id": "dup", "prefix_length": 25},
+                {"id": "dup", "prefix_length": 26},
+            ],
+        },
+    )
+    assert response.status_code == 422
+    assert "dup" in response.json()["detail"][0]["msg"]
+
+
+def test_allocate_invalid_prefix_length_returns_422():
+    for bad in (-1, 33):
+        response = client.post(
+            "/allocate",
+            json={
+                "scope": "10.0.0.0/24",
+                "requests": [{"id": "x", "prefix_length": bad}],
+            },
+        )
+        assert response.status_code == 422, bad
+    # /33 is fine for an IPv6 scope, /129 is not.
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "2001:db8::/32",
+            "requests": [{"id": "x", "prefix_length": 129}],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_allocate_invalid_scope_or_occupied_cidr_returns_422():
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.1/24", "requests": []},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "scope" for err in response.json()["detail"])
+
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.0/24", "occupied": ["bogus"]},
+    )
+    assert response.status_code == 422
+    assert any(
+        err["loc"][-1] == "occupied" for err in response.json()["detail"]
+    )
+
+
+def test_allocate_occupied_wrong_family_returns_422():
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.0/24", "occupied": ["2001:db8::/32"]},
+    )
+    assert response.status_code == 422
+
+
+def test_allocate_occupied_outside_scope_returns_422():
+    response = client.post(
+        "/allocate",
+        json={"scope": "10.0.0.0/24", "occupied": ["10.0.1.0/24"]},
+    )
+    assert response.status_code == 422
+
+
+def test_allocate_overlapping_occupied_returns_422():
+    response = client.post(
+        "/allocate",
+        json={
+            "scope": "10.0.0.0/24",
+            "occupied": ["10.0.0.0/25", "10.0.0.64/26"],
+        },
+    )
+    assert response.status_code == 422
+    assert "overlap" in response.json()["detail"][0]["msg"]
+
+
+def test_allocate_missing_scope_returns_422():
+    response = client.post("/allocate", json={"requests": []})
+    assert response.status_code == 422
+    assert any("scope" in err["loc"] for err in response.json()["detail"])
+
+
+def test_allocate_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    operation = spec["paths"]["/allocate"]["post"]
+    assert "409" in operation["responses"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "lexicographic_with_backtracking" in examples
+    schema = spec["components"]["schemas"]["AllocateResponse"]
+    assert set(schema["properties"]) == {
+        "allocations", "remaining", "remaining_addresses",
+    }

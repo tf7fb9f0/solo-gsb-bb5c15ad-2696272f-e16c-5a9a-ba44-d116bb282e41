@@ -1,12 +1,14 @@
-"""FastAPI application exposing POST /normalize, /evaluate and /compare."""
+"""FastAPI application exposing POST /normalize, /evaluate, /compare and /allocate."""
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
-from app.policy import compare, evaluate, normalize
+from app.policy import allocate, compare, evaluate, normalize
 from app.schemas import (
     AddressDecision,
+    AllocateRequest,
+    AllocateResponse,
     CompareRequest,
     CompareResponse,
     EvaluateRequest,
@@ -20,10 +22,11 @@ app = FastAPI(
         "Compute allow-minus-deny for IPv4/IPv6 CIDR lists, returning the "
         "equivalent, non-overlapping, minimum-count CIDR set; evaluate "
         "individual addresses against the same lists via longest-prefix "
-        "match; and diff two policy sets (baseline vs candidate) over a "
-        "scope CIDR."
+        "match; diff two policy sets (baseline vs candidate) over a "
+        "scope CIDR; and allocate non-overlapping subnets for a list of "
+        "requests inside one scope, avoiding already-occupied CIDRs."
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -203,3 +206,102 @@ def compare_policies(request: CompareRequest) -> dict:
         request.candidate.allow,
         request.candidate.deny,
     )
+
+
+@app.post(
+    "/allocate",
+    response_model=AllocateResponse,
+    tags=["policy"],
+    summary="Allocate non-overlapping subnets for requests inside a scope",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "lexicographic_with_backtracking": {
+                            "summary": (
+                                "Greedy first-fit for 'small' would block "
+                                "'big'; backtracking finds the lexicographically"
+                                " smallest complete plan"
+                            ),
+                            "value": {
+                                "scope": "10.0.0.0/23",
+                                "occupied": ["10.0.1.0/25"],
+                                "requests": [
+                                    {"id": "small", "prefix_length": 25},
+                                    {"id": "big", "prefix_length": 24},
+                                ],
+                            },
+                        },
+                        "infeasible": {
+                            "summary": "Two /25s do not fit beside the occupied /25 -> HTTP 409",
+                            "value": {
+                                "scope": "10.0.0.0/24",
+                                "occupied": ["10.0.0.0/25"],
+                                "requests": [
+                                    {"id": "x", "prefix_length": 25},
+                                    {"id": "y", "prefix_length": 25},
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "Allocations in request order plus the remaining free space "
+                "as a minimal CIDR set with its decimal address count."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "lexicographic_with_backtracking": {
+                            "summary": "Lexicographically smallest complete plan",
+                            "value": {
+                                "allocations": [
+                                    {"id": "small", "cidr": "10.0.1.128/25"},
+                                    {"id": "big", "cidr": "10.0.0.0/24"},
+                                ],
+                                "remaining": [],
+                                "remaining_addresses": "0",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        409: {
+            "description": (
+                "No complete assignment exists; no partial allocation is "
+                "returned."
+            ),
+        },
+        422: {
+            "description": (
+                "Invalid scope/occupied CIDR, occupied entry outside the "
+                "scope or of the wrong family, overlapping occupied CIDRs, "
+                "duplicate request id, or invalid prefix length."
+            ),
+        },
+    },
+)
+def allocate_subnets(request: AllocateRequest) -> dict:
+    result = allocate(
+        request.scope,
+        request.occupied,
+        [(item.id, item.prefix_length) for item in request.requests],
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"no complete allocation satisfies all requests within "
+                f"scope {request.scope!r}; no partial allocation returned"
+            ),
+        )
+    return result
